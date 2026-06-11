@@ -1,8 +1,17 @@
 import AppKit
-import CWebP
 
 class ScreenCaptureManager {
     /// Returns a CGImage for the screen under the mouse cursor.
+    ///
+    /// **IMPORTANT — Backing Scale:** `CGDisplayCreateImage()` returns pixel data at the
+    /// display's native resolution. On a Retina display (2x backing scale), the CGImage
+    /// is already 2× the display's point dimensions. All subsequent scaling in
+    /// `encodeJPEGThumbnail` operates on the raw pixel size, which is correct — the
+    /// scaling ratio is computed from actual pixel dimensions, not points. If any future
+    /// code adds a **region-of-interest crop** before the scale, it must divide the crop
+    /// rect by `screen.backingScaleFactor` to avoid cropping only half the intended area.
+    ///
+    /// Used by PushToTalkManager for context capture and ScreenContextPipeline.
     static func captureScreenImage() -> CGImage? {
         guard CGPreflightScreenCaptureAccess() else {
             log("ScreenCaptureManager: Screen recording permission not granted, skipping capture")
@@ -18,49 +27,93 @@ class ScreenCaptureManager {
         return image
     }
 
-    /// Returns WebP data for the screen under the mouse cursor at full Retina
-    /// resolution, compressed in memory via libwebp. No disk I/O.
-    static func captureScreenData() -> Data? {
+    /// Returns a lightweight JPEG thumbnail of the screen (max 512px on longest side, quality 0.4).
+    /// Used as a visual fallback for screen-aware queries. No WebP dependency.
+    ///
+    /// ⚠️ **OCR Warning:** This compresses to 512px 0.4 quality JPEG immediately.
+    /// Running `VNRecognizeTextRequest` on the output will destroy text recognition
+    /// for small IDE or terminal fonts. If OCR is needed, call `captureScreenImage()`
+    /// first to get the raw CGImage at full resolution, run OCR on that, then call
+    /// `encodeJPEGThumbnail()` separately for the thumbnail.
+    static func captureThumbnail(square: Bool = false) -> Data? {
         guard let image = captureScreenImage() else { return nil }
+        return encodeJPEGThumbnail(image, square: square)
+    }
 
-        let width = image.width
-        let height = image.height
+    /// Compute scaled dimensions for a JPEG thumbnail.
+    /// Returns `(scaledWidth, scaledHeight, canvasWidth, canvasHeight)` where:
+    /// - `scaledWidth`/`scaledHeight` are the proportional dimensions capped at `maxDimension`.
+    /// - `canvasWidth`/`canvasHeight` equal `scaledWidth`/`scaledHeight` when `square` is false,
+    ///    or `maxDimension` (square) when `square` is true.
+    static func thumbnailDimensions(
+        imageWidth: CGFloat, imageHeight: CGFloat,
+        maxDimension: CGFloat = 512, square: Bool = false
+    ) -> (scaledWidth: Int, scaledHeight: Int, canvasWidth: Int, canvasHeight: Int) {
+        let scale = min(maxDimension / max(imageWidth, imageHeight), 1.0)
+        let newWidth = Int(imageWidth * scale)
+        let newHeight = Int(imageHeight * scale)
 
-        // Render CGImage into an RGBA bitmap context
-        guard let context = CGContext(
+        if square && newWidth != newHeight {
+            return (newWidth, newHeight, Int(maxDimension), Int(maxDimension))
+        }
+        return (newWidth, newHeight, newWidth, newHeight)
+    }
+
+    /// Encode a CGImage as a lightweight JPEG thumbnail (max 512px on longest side, quality 0.4).
+    ///
+    /// - Parameter square: If true, center-pads (letterboxes) the image to a 1:1 aspect ratio
+    ///   before JPEG compression. Use this when the downstream model expects square inputs
+    ///   (e.g. ViT-based vision models). Without padding, proportional scaling may cause
+    ///   stretching if the model internally forces a square. Default `false`.
+    ///
+    /// ⚠️ **OCR Warning:** The 512px 0.4 quality JPEG is too compressed for reliable
+    /// `VNRecognizeTextRequest` on small fonts. Run OCR on the raw CGImage before this.
+    private static func encodeJPEGThumbnail(_ image: CGImage, square: Bool = false) -> Data? {
+        let (scaledW, scaledH, canvasW, canvasH) = thumbnailDimensions(
+            imageWidth: CGFloat(image.width),
+            imageHeight: CGFloat(image.height),
+            maxDimension: 512,
+            square: square
+        )
+
+        let padToSquare = square && scaledW != scaledH
+
+        guard let ctx = CGContext(
             data: nil,
-            width: width,
-            height: height,
+            width: canvasW,
+            height: canvasH,
             bitsPerComponent: 8,
-            bytesPerRow: width * 4,
+            bytesPerRow: 0,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        ) else {
-            log("ScreenCaptureManager: Could not create bitmap context")
-            return nil
-        }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
 
-        guard let pixelData = context.data else {
-            log("ScreenCaptureManager: Could not get pixel data from context")
-            return nil
-        }
+        ctx.interpolationQuality = .high
 
-        // Encode to WebP via libwebp at quality 70
-        let rgba = pixelData.assumingMemoryBound(to: UInt8.self)
-        var output: UnsafeMutablePointer<UInt8>?
-        let size = WebPEncodeRGBA(rgba, Int32(width), Int32(height), Int32(width * 4), 70.0, &output)
-
-        guard size > 0, let webpPtr = output else {
-            log("ScreenCaptureManager: WebP encoding failed")
-            return nil
+        if padToSquare {
+            // Fill canvas with black (letterbox bars)
+            ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+            ctx.fill(CGRect(x: 0, y: 0, width: canvasW, height: canvasH))
+            // Center the scaled image within the canvas
+            let offsetX = (CGFloat(canvasW) - CGFloat(scaledW)) / 2.0
+            let offsetY = (CGFloat(canvasH) - CGFloat(scaledH)) / 2.0
+            ctx.draw(image, in: CGRect(x: offsetX, y: offsetY, width: CGFloat(scaledW), height: CGFloat(scaledH)))
+        } else {
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(scaledW), height: CGFloat(scaledH)))
         }
 
-        let data = Data(bytes: webpPtr, count: size)
-        WebPFree(webpPtr)
+        guard let resizedImage = ctx.makeImage() else { return nil }
 
-        log("ScreenCaptureManager: Screenshot captured \(width)x\(height), WebP \(data.count / 1024) KB")
-        return data
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            data as CFMutableData, "public.jpeg" as CFString, 1, nil)
+        else { return nil }
+
+        let options: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.4]
+        CGImageDestinationAddImage(dest, resizedImage, options as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+
+        return data as Data
     }
 
     private static func displayIDUnderMouse() -> CGDirectDisplayID {
@@ -74,9 +127,9 @@ class ScreenCaptureManager {
         return CGMainDisplayID()
     }
 
-    /// Legacy file-based capture (kept for callers that need a URL).
+    /// Lightweight screen capture that writes a JPEG thumbnail to disk for tool executors.
     static func captureScreen() -> URL? {
-        guard let data = captureScreenData() else { return nil }
+        guard let data = captureThumbnail() else { return nil }
 
         let fileManager = FileManager.default
         guard let documentsDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first else {
@@ -90,7 +143,7 @@ class ScreenCaptureManager {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let timestamp = formatter.string(from: Date())
-        let fileURL = screenshotsDirectory.appendingPathComponent("screenshot-\(timestamp).webp")
+        let fileURL = screenshotsDirectory.appendingPathComponent("screenshot-\(timestamp).jpg")
 
         do {
             try data.write(to: fileURL)

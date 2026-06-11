@@ -64,6 +64,16 @@ public class ProactiveAssistantsPlugin: NSObject {
     private var wasScreenshotAppFrontmost = false
     private var screenshotAppBackoffUntil: Date = .distantPast
 
+    // Perceptual screen deduplication: compute a dHash (64-bit perceptual hash) of
+    // the captured CGImage and skip distribution to assistants when the Hamming distance
+    // to the previous frame is small (spinner, cursor blink, clock tick). This saves
+    // network bandwidth (no redundant JPEG uploads to Gemini) and reduces GPU/CPU load
+    // from JPEG encoding. Empirically: spinner animation = 1, cursor shift = 4,
+    // real content change = 23. Threshold 7 catches small visual noise while still
+    // detecting actual content changes.
+    private var lastFrameFingerprint: UInt64?
+    private let screenDedupThreshold = 7
+
     // Change-gated distribution: only distribute frames to assistants when context changes.
     // Eliminates continuous polling when the user stays on the same app/window.
     private var lastDistributedApp: String?
@@ -758,6 +768,14 @@ public class ProactiveAssistantsPlugin: NSObject {
         // Mutable because windowGone retry may re-resolve to a different app.
         var appName = realAppName ?? currentApp
 
+        // Semantic diff: compute a perceptual hash before any heavy processing.
+        // This runs on the raw CGImage (before JPEG encoding) so the dHash is
+        // computed at display-native resolution for maximum accuracy.
+        // If the screen hasn't changed perceptually, skip JPEG encoding and
+        // distribution entirely — saves both CPU (encodeJPEG) and network
+        // bandwidth (Gemini API call).
+        var screenIsStatic = false
+
         // Always capture frames (other features may need them)
         // macOS 14+: capture CGImage directly, encode JPEG once for assistants,
         // pass CGImage to RewindIndexer (avoids redundant encode/decode round-trips)
@@ -808,44 +826,54 @@ public class ProactiveAssistantsPlugin: NSObject {
                 frameCount += 1
                 let captureTime = Date()
 
-                // Encode JPEG off main actor — CGImageDestinationFinalize is CPU-heavy
-                let captureService = screenCaptureService
-                let jpegData = await Task.detached(priority: .userInitiated) {
-                    captureService.encodeJPEG(from: cgImage)
-                }.value
-                if let jpegData = jpegData {
-                    let frame = CapturedFrame(
-                        jpegData: jpegData,
-                        appName: appName,
-                        windowTitle: currentWindowTitle,
-                        frameNumber: frameCount,
-                        captureTime: captureTime
-                    )
+                // Perceptual dedup: compute dHash on the raw CGImage (before JPEG loss).
+                // If the screen hasn't changed meaningfully, skip JPEG encoding and
+                // distribution — saves bandwidth and GPU/CPU.
+                let fingerprint = RewindOCRService.dHash(of: cgImage)
+                if let last = lastFrameFingerprint {
+                    let distance = (fingerprint ^ last).nonzeroBitCount
+                    screenIsStatic = distance <= screenDedupThreshold
+                }
+                lastFrameFingerprint = fingerprint
 
-                    // Privacy gate: skip ALL assistant paths for Rewind-excluded apps.
-                    // This includes trackFrame — the tracked frame can be passed to assistants
-                    // via onContextSwitch (e.g. TaskAssistant), so excluded frames must never
-                    // be stored as lastTrackedFrame.
-                    // Context switch detection still works: it uses lastTrackedApp/lastTrackedWindowTitle
-                    // (set by checkContextSwitch), not lastTrackedFrame.
-                    if isRewindExcluded {
-                        log("PrivacyGate: Blocked frame from Rewind-excluded app '\(appName)' — not sent to assistants")
-                    }
-                    if !isRewindExcluded {
-                        AssistantCoordinator.shared.trackFrame(frame)
-                        if !isInDelayPeriod {
-                            distributeFrameIfChanged(frame)
-                        } else {
-                            // During delay, still distribute to assistants that need it (e.g. refocus detection)
-                            AssistantCoordinator.shared.distributeFrameDuringDelay(frame)
+                if screenIsStatic {
+                    // Screen is perceptually identical to the previous frame — skip
+                    // JPEG encoding, distribution, and Rewind indexing.
+                    log("ScreenDedup: Frame \(frameCount) is static (dHash distance ≤ \(screenDedupThreshold)), skipping distribution")
+                } else {
+                    // Screen changed — encode JPEG and distribute to assistants
+                    let captureService = screenCaptureService
+                    let jpegData = await Task.detached(priority: .userInitiated) {
+                        captureService.encodeJPEG(from: cgImage)
+                    }.value
+                    if let jpegData = jpegData {
+                        let frame = CapturedFrame(
+                            jpegData: jpegData,
+                            appName: appName,
+                            windowTitle: currentWindowTitle,
+                            frameNumber: frameCount,
+                            captureTime: captureTime
+                        )
+
+                        // Privacy gate: skip ALL assistant paths for Rewind-excluded apps.
+                        if isRewindExcluded {
+                            log("PrivacyGate: Blocked frame from Rewind-excluded app '\(appName)' — not sent to assistants")
+                        }
+                        if !isRewindExcluded {
+                            AssistantCoordinator.shared.trackFrame(frame)
+                            if !isInDelayPeriod {
+                                distributeFrameIfChanged(frame)
+                            } else {
+                                AssistantCoordinator.shared.distributeFrameDuringDelay(frame)
+                            }
                         }
                     }
                 }
 
-                // Pass CGImage directly to RewindIndexer (only if not excluded from Rewind)
-                // Backpressure: skip this frame if the previous one is still being processed.
-                // Without this, fire-and-forget Tasks queue up holding CGImages (~24MB each),
-                // causing multi-GB memory growth when encoding can't keep up with capture rate.
+                // Pass CGImage directly to RewindIndexer (only if not excluded and screen changed).
+                // Note: Rewind has its own dHash dedup in RewindOCRService.shouldSkipOCR(),
+                // so we still pass the CGImage here and let Rewind handle its own dedup.
+                // The dHash above only gates the Gemini distribution path.
                 if !isRewindExcluded {
                     if isProcessingRewindFrame {
                         droppedFrameCount += 1
